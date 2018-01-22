@@ -1,68 +1,70 @@
-const statusDescription = {
-  pending: 'The LaTeX typesetting is in progress',
-  success: 'The LaTeX typesetting finished'
-};
+var Git = require('nodegit');
+var tmp = require('tmp');
+
 const statusContext = 'continuous-integration/latex/';
+const status = {
+  pending: {
+    state: 'pending',
+    description: 'Typesetting is in progress'
+  },
+  success: {
+    state: 'success',
+    description: 'Typesetting finished'
+  },
+  failure: {
+    state: 'failure',
+    description: 'Unable to start build'
+  }
+};
 
 let robot;
 
-function queueTypeset(context, owner, repo, sha) {
+function setStatus(context, owner, repo, sha, type, status, description) {
   context.github.repos.createStatus({
     owner: owner,
     repo: repo,
     sha: sha,
-    state: 'pending',
-    description: statusDescription.pending,
-    context: statusContext + 'typesetting'
+    state: status.state,
+    description: typeof description === 'string' ? description : status.description,
+    context: statusContext + type
+  }).catch(function(err) {
+    robot.log("Failed to set status!");
+    robot.log(err);
   });
-
-  setTimeout(() => {
-    robot.log(`Typesetting finished (${owner}/${repo}:${sha})!`);
-    context.github.repos.createStatus({
-      owner: owner,
-      repo: repo,
-      sha: sha,
-      state: 'success',
-      description: statusDescription.success,
-      context: statusContext + 'typesetting'
-    });
-  }, 30000);
 }
 
-function queueSpellchecking(context, owner, repo, sha) {
-  context.github.repos.createStatus({
-    owner: owner,
-    repo: repo,
-    sha: sha,
-    state: 'pending',
-    description: statusDescription.pending,
-    context: statusContext + 'spellchecking'
+function queueBuild(context, owner, repo, sha, ref, pr = false) {
+  var tmpobj = tmp.dirSync({ unsafeCleanup: true });
+
+  setStatus(context, owner, repo, sha, 'typesetting', status.pending, 'Cloning repository');
+  if (pr) setStatus(context, owner, repo, sha, 'spellchecking', status.pending, 'Cloning repository');
+
+  robot.log(`Cloning https://github.com/${owner}/${repo} into ${tmpobj.name}`);
+
+  Git.Clone(`https://github.com/${owner}/${repo}`, tmpobj.name, { checkoutBranch: ref.replace('refs/heads/', '') }).then(function(repository) {
+    robot.log(`Clone successfull (https://github.com/${owner}/${repo})!`);
+    setStatus(context, owner, repo, sha, 'typesetting', status.pending);
+    if (pr) setStatus(context, owner, repo, sha, 'spellchecking', status.pending, 'Awaiting PDF output');
+
+    // TODO Run typesetting
+    // TODO Run spellchecking once typesetting finishes (only if this is a PR)
+    // TODO Add a comment when spellchecking finished (only if this is a PR)
+    // TODO Release to github releases as pre-release (only on master)
+
+    // TODO Remove temporary folder contents
+
+  }).catch(function (err) {
+    robot.log("Failed to pull repository!");
+    robot.log(err);
+
+    setStatus(context, owner, repo, sha, 'typesetting', status.failure);
+    if (pr) setStatus(context, owner, repo, sha, 'spellchecking', status.failure);
   });
-
-  setTimeout(() => {
-    robot.log(`Spellchecking finished (${owner}/${repo}:${sha})!`);
-    context.github.repos.createStatus({
-      owner: owner,
-      repo: repo,
-      sha: sha,
-      state: 'success',
-      description: statusDescription.success,
-      context: statusContext + 'spellchecking'
-    });
-  }, 10000);
-}
-
-function queueBuild(context, owner, repo, sha) {
-  queueSpellchecking(context, owner, repo, sha);
-  queueTypeset(context, owner, repo, sha);
 }
 
 function processPullRequest(context) {
-  robot.log(context.payload);
-
   const head = context.payload.pull_request.head;
-  // TODO Add flag that it is a PR and that we should comment on it.
-  queueBuild(context, head.repo.owner.login, head.repo.name, head.sha);
+  queueBuild(context, head.repo.owner.login, head.repo.name, head.sha, head.ref, true);
 }
 
 module.exports = (r) => {
@@ -79,7 +81,8 @@ module.exports = (r) => {
         queueBuild(context,
           context.payload.repository.owner.name,
           context.payload.repository.name,
-          commit.id
+          commit.id,
+          context.payload.ref
         );
       }
   });
@@ -89,7 +92,7 @@ module.exports = (r) => {
       processPullRequest(context);
   });
 
-  robot.on('pull_request.synchronized', context => {
+  robot.on('pull_request.synchronize', context => {
       robot.log('PR synchronized!');
       processPullRequest(context);
   });

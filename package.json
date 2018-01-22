@@ -10,7 +10,9 @@
     "test": "jest && standard"
   },
   "dependencies": {
-    "probot": "^5.0.0"
+    "nodegit": "^0.20.3",
+    "probot": "^5.0.0",
+    "tmp": "0.0.33"
   },
   "devDependencies": {
     "jest": "^21.2.1",
