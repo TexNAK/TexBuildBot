@@ -1,5 +1,7 @@
 var Docker = require('dockerode');
+var rimraf = require('rimraf');
 var stream = require('stream');
+var yaml = require('js-yaml');
 var Git = require('nodegit');
 var path = require('path');
 var tmp = require('tmp');
@@ -27,6 +29,27 @@ const status = {
 };
 
 let robot;
+
+function allComplete(promises) {
+  "use strict";
+
+  return new Promise(resolve => {
+      let retVals = Array(promises.length).fill();
+      let states = Array(promises.length).fill();
+
+      let f = i => res => {
+          retVals[i] = res;
+          states[i] = true;
+          if (states.every(s => s)) {
+              resolve(retVals);
+          }
+      };
+
+      promises.forEach((p, i) => {
+          Promise.resolve(p).then(f(i), f(i));
+      });
+  });
+}
 
 async function runTypesettingContainer(srcDirectory, entrypoint) {
   const dockerOptions = {
@@ -128,14 +151,48 @@ function setStatus(context, type, status, description) {
   });
 }
 
-function executeBuild(context, srcDirectory, entrypoint) {
-  /// Run typesetting
-  runTypesettingContainer(srcDirectory, entrypoint).then((res) => {
+function executeBuild(context, srcDirectory, entrypoints) {
+
+  const typesettingBuilds = [];
+
+  robot.log("Building entrypoints", entrypoints);
+
+  for (let entrypoint in entrypoints) {
+    entrypoint = entrypoints[entrypoint];
+    typesettingBuilds.push(runTypesettingContainer(srcDirectory, entrypoint));
+  }
+
+  const buildFailed = (err) => {
+    robot.log("Build failed!", err);
+    setStatus(context, 'typesetting', status.error);
+    if (context.pr && context.config.spellchecking) setStatus(context, 'spellchecking', status.failure, 'No PDF artifact available');
+  }
+
+  allComplete(typesettingBuilds).then((results) => {
     setStatus(context, 'typesetting', status.success);
 
-    if (context.pr) {
+    const artifacts = [];
+    for (let res in results) {
+      if (results[res].artifact === undefined) {
+        buildFailed(results[res]);
+        return;
+      }
+      artifacts.push(results[res].artifact);
+    }
+
+    let spellcheckingFinished = false;
+    let releasingFinished = false;
+
+    const deleteTemporaryDirectory = () => {
+      if (srcDirectory === '/') console.log("Nice try. I ain't deleting maself!");
+      else rimraf(srcDirectory, (err) => {
+        if (err) robot.log("Failed to delete temporary directory");
+      });
+    }
+
+    /// Run the spellchecker and comment on the PR
+    if (context.pr && context.config.spellchecking) {
       setStatus(context, 'spellchecking', status.pending, 'Spellchecking is in progress');
-      /// Run spellchecking once typesetting finishes
       runSpellcheckingContainer(srcDirectory).then((res) => {
         // Add res as a comment on the PR
         const commentData = {
@@ -145,20 +202,27 @@ function executeBuild(context, srcDirectory, entrypoint) {
           body: res.log
         };
         context.ctx.github.issues.createComment(commentData, (err, result) => {
+          spellcheckingFinished = true;
           if (!err)
             setStatus(context, 'spellchecking', status.success, 'Spellchecking successful');
           else
             setStatus(context, 'spellchecking', status.failure, 'Unable to post comment');
+
+          if (releasingFinished) deleteTemporaryDirectory();
         });
 
       }).catch((err) => {
+        spellcheckingFinished = true;
         setStatus(context, 'spellchecking', status.error, 'Spellchecking threw error');
+        if (releasingFinished) deleteTemporaryDirectory();
       });
+    } else {
+      spellcheckingFinished = true;
     }
 
-    // Release res.artifact to github as pre-release (only on master)
-    if (context.branch === 'master') {
-      robot.log("Emitting pre-release");
+    /// Check if this branch is qualified for prereleases and release the artifacts
+    if (context.branch === context.config.prerelease) {
+      robot.log("Emitting pre-release with artifacts", artifacts);
       context.ctx.github.repos.createRelease({
         owner: context.owner,
         repo: context.repo,
@@ -167,27 +231,57 @@ function executeBuild(context, srcDirectory, entrypoint) {
         name: context.commitMessage,
         prerelease: true
       }).then((release) => {
-        const assetData = {
-          id: release.data.id,
-          owner: context.owner,
-          repo: context.repo,
-          url: release.data.upload_url,
-          filePath: res.artifact,
-          name: path.basename(res.artifact)
-        };
+        const uploadAssets = [];
+        for (let artifact in artifacts) {
+          const assetData = {
+            id: release.data.id,
+            owner: context.owner,
+            repo: context.repo,
+            url: release.data.upload_url,
+            filePath: artifacts[artifact],
+            name: path.basename(artifacts[artifact])
+          };
 
-        context.ctx.github.repos.uploadAsset(assetData);
+          uploadAssets.push(context.ctx.github.repos.uploadAsset(assetData));
+        }
+
+        allComplete(uploadAssets).then(() => {
+          releasingFinished = true;
+          if (spellcheckingFinished) deleteTemporaryDirectory();
+        });
       });
-
+    } else {
+      releasingFinished = true;
     }
 
-    // TODO Remove temporary folder contents
+    robot.log("Build succeeded");
+    if (spellcheckingFinished && releasingFinished) deleteTemporaryDirectory();
 
-  }).catch((err) => {
-    robot.log("Build failed!", err);
-    setStatus(context, 'typesetting', status.error);
-    if (context.pr) setStatus(context, 'spellchecking', status.failure, 'No PDF artifact available');
-  });
+  }).catch(buildFailed);
+}
+
+function loadConfig(directory) {
+  let config = {
+    spellchecking: false,
+    statistics: false,
+    prerelease: 'master',
+    entrypoints: ['./main.tex'],
+    dictionaryFile: undefined
+  }
+
+  const configPath = path.join(directory, '.texbuild.yml');
+  if (fs.existsSync(configPath)) {
+    try {
+      var doc = yaml.safeLoad(fs.readFileSync(configPath, 'utf8'));
+      config = Object.assign(config, doc);
+    } catch (e) {
+      console.log(e);
+    }
+  }
+
+  console.log(config);
+
+  return config;
 }
 
 function queueBuild(context, ref) {
@@ -198,20 +292,20 @@ function queueBuild(context, ref) {
   const { owner, repo, sha } = context;
 
   setStatus(context, 'typesetting', status.pending, 'Cloning repository');
-  if (context.pr) setStatus(context, 'spellchecking', status.pending, 'Cloning repository');
 
   robot.log(`Cloning https://github.com/${owner}/${repo} into ${cloneDir}`);
 
   Git.Clone(`https://github.com/${owner}/${repo}`, cloneDir, { checkoutBranch: ref.replace('refs/heads/', '') }).then(function(repository) {
     robot.log(`Clone successful (https://github.com/${owner}/${repo})!`);
+    context.config = loadConfig(cloneDir);
 
     repository.getCommit(context.sha).then((commit) => {
       context.commitMessage = commit.message();
 
       setStatus(context, 'typesetting', status.pending);
-      if (context.pr) setStatus(context, 'spellchecking', status.pending, 'Awaiting PDF output');
+      if (context.pr && context.config.spellchecking) setStatus(context, 'spellchecking', status.pending, 'Awaiting PDF output');
 
-      executeBuild(context, cloneDir, './main.tex');
+      executeBuild(context, cloneDir, context.config.entrypoints);
 
     });
 
@@ -220,7 +314,7 @@ function queueBuild(context, ref) {
     robot.log(err);
 
     setStatus(context, 'typesetting', status.failure);
-    if (context.pr) setStatus(context, 'spellchecking', status.failure);
+    if (context.pr && context.config.spellchecking) setStatus(context, 'spellchecking', status.failure);
   });
 }
 
@@ -241,10 +335,14 @@ module.exports = (r) => {
   robot = r;
 
   robot.on('push', ctx => {
-      robot.log('Push received!');
-
       for (commit in ctx.payload.commits) {
         commit = ctx.payload.commits[commit];
+
+        if (!commit.distinct) {
+          robot.log(`Skipping non-distinct commit ${commit.id}`);
+          continue;
+        }
+
         robot.log(`Received commit (${commit.id})`);
 
         queueBuild({
