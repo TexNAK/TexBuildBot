@@ -53,6 +53,11 @@ function queueBuild(context, owner, repo, sha, ref, pr = false) {
 
     // TODO Remove temporary folder contents
 
+    setTimeout(function () {
+      setStatus(context, owner, repo, sha, 'typesetting', status.success);
+      if (pr) setStatus(context, owner, repo, sha, 'spellchecking', status.success, 'Spellchecking finished');
+    }, 15000);
+
   }).catch(function (err) {
     robot.log("Failed to pull repository!");
     robot.log(err);
@@ -63,6 +68,7 @@ function queueBuild(context, owner, repo, sha, ref, pr = false) {
 }
 
 function processPullRequest(context) {
+  // TODO Ignore push which triggers PR sync
   const head = context.payload.pull_request.head;
   queueBuild(context, head.repo.owner.login, head.repo.name, head.sha, head.ref, true);
 }
