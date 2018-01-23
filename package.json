@@ -10,6 +10,8 @@
     "test": "jest && standard"
   },
   "dependencies": {
+    "dockerode": "^2.5.3",
+    "node-datetime": "^2.0.3",
     "nodegit": "^0.20.3",
     "probot": "^5.0.0",
     "tmp": "0.0.33"

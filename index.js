@@ -1,6 +1,11 @@
+var Docker = require('dockerode');
+var stream = require('stream');
 var Git = require('nodegit');
+var path = require('path');
 var tmp = require('tmp');
+var fs = require('fs');
 
+const docker = new Docker();
 const statusContext = 'continuous-integration/latex/';
 const status = {
   pending: {
@@ -11,16 +16,106 @@ const status = {
     state: 'success',
     description: 'Typesetting finished'
   },
+  error: {
+    state: 'error',
+    description: 'Typesetting failed'
+  },
   failure: {
     state: 'failure',
-    description: 'Unable to start build'
+    description: 'An internal error occurred'
   }
 };
 
 let robot;
 
-function setStatus(context, owner, repo, sha, type, status, description) {
-  context.github.repos.createStatus({
+async function runTypesettingContainer(srcDirectory, entrypoint) {
+  const dockerOptions = {
+    Tty: false,
+    HostConfig: {
+      Binds: [`${srcDirectory}:/data`],
+      NetworkDisabled: true
+    }
+  }
+
+  var logOutput = "";
+  var logStream = new stream.PassThrough();
+  logStream.on('data', function(chunk){
+    logOutput += chunk.toString('utf8');
+  });
+
+  return new Promise((resolve, reject) => {
+    docker.run('texbuildbot-typesetting', [entrypoint], [logStream, logStream], dockerOptions, function (err, data, container) {
+      if (err)
+        reject({
+          message: 'Container launch failed',
+          error: err
+        });
+      else {
+        if (data.StatusCode === 0)
+          resolve({
+            message: 'Build succeeded',
+            artifact: path.join(srcDirectory, entrypoint.replace('.tex', '.pdf')),
+            log: logOutput
+          });
+        else
+          reject({
+            message: 'LaTeX build failed!',
+            log: logOutput
+          });
+
+        container.remove(function (err, data) {
+          if (err) console.error('Unable to delete container!', err);
+        })
+      }
+    });
+  });
+}
+
+async function runSpellcheckingContainer(srcDirectory) {
+  const dockerOptions = {
+    Tty: false,
+    HostConfig: {
+      Binds: [`${srcDirectory}:/data`]
+    }
+  }
+
+  var logOutput = "";
+  var logStream = new stream.PassThrough();
+  logStream.on('data', function(chunk){
+    logOutput += chunk.toString('utf8');
+  });
+
+  return new Promise((resolve, reject) => {
+    docker.run('texbuildbot-spellchecking', [], [logStream, logStream], dockerOptions, function (err, data, container) {
+      if (err)
+        reject({
+          message: 'Container launch failed',
+          error: err
+        });
+      else {
+        if (data.StatusCode === 0)
+          resolve({
+            message: 'Spellchecking succeeded',
+            log: logOutput
+          });
+        else
+          reject({
+            message: 'Spellchecking failed!',
+            log: logOutput
+          });
+
+        container.remove(function (err, data) {
+          if (err) console.error('Unable to delete container!', err);
+        })
+      }
+    });
+  });
+}
+
+function setStatus(context, type, status, description) {
+  const { ctx, owner, repo, sha } = context;
+
+  ctx.github.repos.createStatus({
     owner: owner,
     repo: repo,
     sha: sha,
@@ -33,74 +128,142 @@ function setStatus(context, owner, repo, sha, type, status, description) {
   });
 }
 
-function queueBuild(context, owner, repo, sha, ref, pr = false) {
-  var tmpobj = tmp.dirSync({ unsafeCleanup: true });
+function executeBuild(context, srcDirectory, entrypoint) {
+  /// Run typesetting
+  runTypesettingContainer(srcDirectory, entrypoint).then((res) => {
+    setStatus(context, 'typesetting', status.success);
 
-  setStatus(context, owner, repo, sha, 'typesetting', status.pending, 'Cloning repository');
-  if (pr) setStatus(context, owner, repo, sha, 'spellchecking', status.pending, 'Cloning repository');
+    if (context.pr) {
+      setStatus(context, 'spellchecking', status.pending, 'Spellchecking is in progress');
+      /// Run spellchecking once typesetting finishes
+      runSpellcheckingContainer(srcDirectory).then((res) => {
+        // Add res as a comment on the PR
+        const commentData = {
+          owner: context.owner,
+          repo: context.repo,
+          number: context.pr,
+          body: res.log
+        };
+        context.ctx.github.issues.createComment(commentData, (err, result) => {
+          if (!err)
+            setStatus(context, 'spellchecking', status.success, 'Spellchecking successful');
+          else
+            setStatus(context, 'spellchecking', status.failure, 'Unable to post comment');
+        });
 
-  robot.log(`Cloning https://github.com/${owner}/${repo} into ${tmpobj.name}`);
+      }).catch((err) => {
+        setStatus(context, 'spellchecking', status.error, 'Spellchecking threw error');
+      });
+    }
 
-  Git.Clone(`https://github.com/${owner}/${repo}`, tmpobj.name, { checkoutBranch: ref.replace('refs/heads/', '') }).then(function(repository) {
-    robot.log(`Clone successfull (https://github.com/${owner}/${repo})!`);
-    setStatus(context, owner, repo, sha, 'typesetting', status.pending);
-    if (pr) setStatus(context, owner, repo, sha, 'spellchecking', status.pending, 'Awaiting PDF output');
+    // Release res.artifact to github as pre-release (only on master)
+    if (context.branch === 'master') {
+      robot.log("Emitting pre-release");
+      context.ctx.github.repos.createRelease({
+        owner: context.owner,
+        repo: context.repo,
+        tag_name: `merge-${new Date().toISOString().replace(/:/g, '-')}`,
+        target_commitish: context.sha,
+        name: context.commitMessage,
+        prerelease: true
+      }).then((release) => {
+        const assetData = {
+          id: release.data.id,
+          owner: context.owner,
+          repo: context.repo,
+          url: release.data.upload_url,
+          filePath: res.artifact,
+          name: path.basename(res.artifact)
+        };
 
-    // TODO Run typesetting
-    // TODO Run spellchecking once typesetting finishes (only if this is a PR)
-    // TODO Add a comment when spellchecking finished (only if this is a PR)
-    // TODO Release to github releases as pre-release (only on master)
+        context.ctx.github.repos.uploadAsset(assetData);
+      });
+
+    }
 
     // TODO Remove temporary folder contents
 
-    setTimeout(function () {
-      setStatus(context, owner, repo, sha, 'typesetting', status.success);
-      if (pr) setStatus(context, owner, repo, sha, 'spellchecking', status.success, 'Spellchecking finished');
-    }, 15000);
+  }).catch((err) => {
+    robot.log("Build failed!", err);
+    setStatus(context, 'typesetting', status.error);
+    if (context.pr) setStatus(context, 'spellchecking', status.failure, 'No PDF artifact available');
+  });
+}
+
+function queueBuild(context, ref) {
+  const tmpobj = tmp.dirSync({ unsafeCleanup: true });
+  const cloneDir = fs.realpathSync(tmpobj.name);
+  context.branch = ref.replace('refs/heads/', '');
+
+  const { owner, repo, sha } = context;
+
+  setStatus(context, 'typesetting', status.pending, 'Cloning repository');
+  if (context.pr) setStatus(context, 'spellchecking', status.pending, 'Cloning repository');
+
+  robot.log(`Cloning https://github.com/${owner}/${repo} into ${cloneDir}`);
+
+  Git.Clone(`https://github.com/${owner}/${repo}`, cloneDir, { checkoutBranch: ref.replace('refs/heads/', '') }).then(function(repository) {
+    robot.log(`Clone successful (https://github.com/${owner}/${repo})!`);
+
+    repository.getCommit(context.sha).then((commit) => {
+      context.commitMessage = commit.message();
+
+      setStatus(context, 'typesetting', status.pending);
+      if (context.pr) setStatus(context, 'spellchecking', status.pending, 'Awaiting PDF output');
+
+      executeBuild(context, cloneDir, './main.tex');
+
+    });
 
   }).catch(function (err) {
     robot.log("Failed to pull repository!");
     robot.log(err);
 
-    setStatus(context, owner, repo, sha, 'typesetting', status.failure);
-    if (pr) setStatus(context, owner, repo, sha, 'spellchecking', status.failure);
+    setStatus(context, 'typesetting', status.failure);
+    if (context.pr) setStatus(context, 'spellchecking', status.failure);
   });
 }
 
-function processPullRequest(context) {
+function processPullRequest(ctx) {
   // TODO Ignore push which triggers PR sync
-  const head = context.payload.pull_request.head;
-  queueBuild(context, head.repo.owner.login, head.repo.name, head.sha, head.ref, true);
+  const head = ctx.payload.pull_request.head;
+  queueBuild({
+    ctx: ctx,
+    owner: head.repo.owner.login,
+    repo: head.repo.name,
+    sha: head.sha,
+    pr: ctx.payload.pull_request.number
+  }, head.ref, true);
 }
 
 module.exports = (r) => {
 
   robot = r;
 
-  robot.on('push', context => {
+  robot.on('push', ctx => {
       robot.log('Push received!');
 
-      for (commit in context.payload.commits) {
-        commit = context.payload.commits[commit];
+      for (commit in ctx.payload.commits) {
+        commit = ctx.payload.commits[commit];
         robot.log(`Received commit (${commit.id})`);
 
-        queueBuild(context,
-          context.payload.repository.owner.name,
-          context.payload.repository.name,
-          commit.id,
-          context.payload.ref
-        );
+        queueBuild({
+          ctx: ctx,
+          owner: ctx.payload.repository.owner.name,
+          repo: ctx.payload.repository.name,
+          sha: commit.id
+        }, ctx.payload.ref);
       }
   });
 
-  robot.on('pull_request.opened', context => {
+  robot.on('pull_request.opened', ctx => {
       robot.log('PR opened!');
-      processPullRequest(context);
+      processPullRequest(ctx);
   });
 
-  robot.on('pull_request.synchronize', context => {
+  robot.on('pull_request.synchronize', ctx => {
       robot.log('PR synchronized!');
-      processPullRequest(context);
+      processPullRequest(ctx);
   });
 
 }

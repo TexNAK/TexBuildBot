@@ -4,4 +4,4 @@ RUN apt-get update && apt-get install -f -y poppler-utils && apt-get clean
 
 COPY ./spellchecker.py .
 
-CMD ["python", "./spellchecker.py", "-o", "/data/output.md", "/data"]
+CMD ["python", "./spellchecker.py", "/data"]
