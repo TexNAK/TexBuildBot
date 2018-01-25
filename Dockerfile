@@ -3,12 +3,13 @@ FROM node:latest
 RUN mkdir /app
 WORKDIR /app
 
-COPY ./index.js .
 COPY ./package.json .
+RUN npm install
+
 COPY ./.env.production .env
 COPY ./private-key.pem ./private-key.pem
 
-RUN npm install
+COPY ./index.js .
 
 EXPOSE 3000
 CMD npm start
