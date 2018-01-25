@@ -30,6 +30,13 @@ const status = {
 
 let robot;
 
+function uuidv4() {
+  return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function(c) {
+    var r = Math.random() * 16 | 0, v = c == 'x' ? r : (r & 0x3 | 0x8);
+    return v.toString(16);
+  });
+}
+
 function allComplete(promises) {
   "use strict";
 
@@ -285,8 +292,11 @@ function loadConfig(directory) {
 }
 
 function queueBuild(context, ref) {
-  const tmpobj = tmp.dirSync({ unsafeCleanup: true });
-  const cloneDir = fs.realpathSync(tmpobj.name);
+  // const tmpobj = tmp.dirSync({ unsafeCleanup: true });
+  const cloneDir = "/tmp/texbuildbot/" + uuidv4(); //fs.realpathSync(tmpobj.name);
+  if (!fs.existsSync(cloneDir)){
+    fs.mkdirSync(cloneDir);
+  }
   context.branch = ref.replace('refs/heads/', '');
 
   const { owner, repo, sha } = context;
